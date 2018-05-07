@@ -19,7 +19,6 @@
 
 BINARY = src/disco/main
 
-LDSCRIPT = ../stm32f4-discovery.ld
+LDSCRIPT = src/disco/stm32f4-disco.ld
 
-include ../../Makefile.include
-
+include src/libopencm3.target.mk
