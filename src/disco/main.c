@@ -1,4 +1,6 @@
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <libopencm3/cm3/common.h>
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
@@ -12,6 +14,7 @@
 #define DEBUG
 
 #define RX_FIFO_SIZE 128
+#define TX_FIFO_SIZE 256
 
 #define LED5_OFF (gpio_clear(GPIOD, GPIO14))
 #define LED5_ON (gpio_set(GPIOD, GPIO14))
@@ -29,16 +32,24 @@
 
 #define OTG_GOTGCTL_CIDSTS (1 << 16)
 #define OTG_HPRT_PCTS (1 << 0)
+#define OTG_HPRT_PENA (1 << 2)
 #define OTG_HNPTXFSIZ (0x028)
+#define OTG_HNPTXSTS (0x02c)
+#define OTG_FS_HNPTXSTS MMIO32(USB_OTG_FS_BASE + OTG_HNPTXSTS)
 #define OTG_FS_HNPTXFSIZ MMIO32(USB_OTG_FS_BASE + OTG_HNPTXFSIZ)
 
+#define _raise_error (LED5_ON)
 #define _is_host (OTG_FS_GINTSTS & OTG_GINTSTS_CMOD)
 #define _is_usba (OTG_FS_GOTGCTL & OTG_GOTGCTL_CIDSTS)
 #define _is_dev_connected (OTG_FS_HPRT & OTG_HPRT_PCTS)
+#define _is_port_enabled (OTG_FS_HPRT & OTG_HPRT_PENA)
+#define _fifo_space (OTG_FS_HNPTXSTS & 0xffff)
 
 typedef struct NptxFifo {
    size_t mem_top;
+   size_t len;
    uint8_t * buf;  
+   uint8_t head [TX_FIFO_SIZE];
 } NptxFifo;
 
 static NptxFifo nptx_fifo;
@@ -49,6 +60,16 @@ typedef struct PtxFifo {
 } PtxFifo;
 
 static PtxFifo ptx_fifo;
+
+inline void _status(void) {
+    LED5_OFF;
+    LED3_OFF;
+    LED4_OFF;
+    LED6_OFF;
+    if (_is_host) LED5_ON;
+    if (_is_dev_connected) LED6_ON;
+    if (_is_port_enabled) LED4_ON;
+}
 
 inline bool _dev_detected(void) {
     if (OTG_FS_HPRT & OTG_HPRT_PCDET) {
@@ -63,6 +84,15 @@ inline bool _dev_detected(void) {
 inline bool _port_change_detected(void) {
     if (OTG_FS_HPRT & OTG_HPRT_PENCHNG) {
         // OTG_FS_HPRT |= OTG_HPRT_PENCHNG;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+inline bool _tx_empty_detected(void) {
+    if (OTG_FS_GINTSTS & OTG_GINTSTS_PTXFE) {
+        OTG_FS_GINTSTS |= OTG_GINTSTS_PTXFE;
         return true;
     } else {
         return false;
@@ -85,7 +115,6 @@ inline void platform_init(void) {
     /* Setup LEDs */
     rcc_periph_clock_enable(RCC_GPIOD);
     gpio_mode_setup(GPIOD, GPIO_MODE_OUTPUT, GPIO_PUPD_PULLDOWN, GPIO14 | GPIO12 | GPIO13 | GPIO15);
-    LED5_ON;
 
     /* Setup VBUS charge pump */
     rcc_periph_clock_enable(RCC_GPIOC);
@@ -182,6 +211,38 @@ inline void usb_otg_core_init(void) {
     gpio_clear(GPIOC, GPIO0);
 }
 
+void usb_otg_channel_init(void) {
+    /* Unmask FIFO empty interrupt */
+    OTG_FS_GINTMSK |= OTG_GINTMSK_PTXFEM;
+
+    /* Unmask channel interrupts */
+    OTG_FS_HAINTMSK |= (1 << 0);
+    OTG_FS_HAINTMSK |= (1 << 1);
+
+    /* Unmask transaction related interrupts */
+    // TODO
+
+    /* Set channel operating parameters */
+    OTG_FS_HCTSIZ(0) |= 64; // max transfer size
+    OTG_FS_HCTSIZ(1) |= 64; // max transfer size
+
+    /* Set channel endpoint */
+    OTG_FS_HCCHAR(0) |= OTG_HCCHAR_EPTYP_BULK; // USB bulk transfer type
+    OTG_FS_HCCHAR(0) |= OTG_HCCHAR_EPDIR_OUT; // USB OUT direction
+    OTG_FS_HCCHAR(0) |= (OTG_HCCHAR_EPNUM_MASK & (0x02 << 11)); // Endpoint number 2
+    OTG_FS_HCCHAR(0) |= 0X0200; // 512 bytes max packet size
+
+    OTG_FS_HCCHAR(1) |= OTG_HCCHAR_EPTYP_BULK; // USB bulk transfer type
+    OTG_FS_HCCHAR(1) |= OTG_HCCHAR_EPDIR_IN; // USB OUT direction
+    OTG_FS_HCCHAR(1) |= (OTG_HCCHAR_EPNUM_MASK & (0x83 << 11)); // Endpoint number 2
+    OTG_FS_HCCHAR(1) |= 0X0200; // 512 bytes max packet size
+
+    /* Enable channel */
+    OTG_FS_HCCHAR(0) |= OTG_HCCHAR_CHENA;
+    OTG_FS_HCCHAR(1) |= OTG_HCCHAR_CHENA;
+
+}
+
 void usb_otg_host_init(void) {
     /* Initialize USB Host */
 
@@ -195,6 +256,7 @@ void usb_otg_host_init(void) {
 
     /* Set full-speed host */
     OTG_FS_HCFG |= OTG_HCFG_FSLSS;
+    OTG_FS_HCFG |= OTG_HCFG_FSLSPCS_48MHz;
 
 	/* Restart the PHY clock. */
 	OTG_FS_PCGCCTL = 0;
@@ -202,9 +264,9 @@ void usb_otg_host_init(void) {
     /* Drive VBUS */
     OTG_FS_HPRT |= OTG_HPRT_PPWR;
 
+
     /* Wait for device to connect */
     while(!_dev_detected());
-    LED6_ON;
 
     /* Reset the device */
     OTG_FS_HPRT ^= OTG_HPRT_PRST;
@@ -212,22 +274,83 @@ void usb_otg_host_init(void) {
         __asm__("nop");
     }
     OTG_FS_HPRT ^= OTG_HPRT_PRST;
-    LED4_ON;
 
     while(!_port_change_detected());
 
-    LED3_ON;
+    /* check USB device speed (make sure it's FS) */
+    if ((OTG_FS_HPRT & OTG_HPRT_PSPD_MASK) != OTG_HPRT_PSPD_FULL) _raise_error;
+
+    /* specify frame interval */
+    OTG_FS_HFIR |= 6;
+
+    /* update connection speed (apparently we have to do this even though it's alreayd been set) */
+    OTG_FS_HCFG |= OTG_HCFG_FSLSPCS_48MHz;
+
     /* Specify FIFO size */
     OTG_FS_GRXFSIZ = RX_FIFO_SIZE;
     /* Setup non-periodic Tx FIFO */
-    nptx_fifo.mem_top = RX_FIFO_SIZE;
-    nptx_fifo.buf = malloc(nptx_fifo.mem_top);
-    OTG_FS_HNPTXFSIZ |= (nptx_fifo.mem_top << 16) | ((uint32_t) nptx_fifo.buf);
+    nptx_fifo.mem_top = TX_FIFO_SIZE;
+    nptx_fifo.buf = OTG_FS_HNPTXFSIZ & 0xffff;
+    OTG_FS_HNPTXFSIZ |= (nptx_fifo.mem_top << 16);
     /* Setup periodic Tx FIFO */
     ptx_fifo.mem_top = RX_FIFO_SIZE;
     ptx_fifo.buf = malloc(ptx_fifo.mem_top);
-    OTG_FS_HPTXFSIZ |= (ptx_fifo.mem_top << 16) | ((uint32_t) ptx_fifo.buf);
+    OTG_FS_HPTXFSIZ |= (ptx_fifo.mem_top << 16);
 
+}
+
+void usb_otg_port_test(void) {
+
+    // OTG_FS_HPRT |= OTG_HPRT_PRES; // resume port signalling 
+    // OTG_FS_HPRT |= OTG_HPRT_PTCTL_PACKET; // start packet test
+
+    if (_is_host) LED6_ON;
+    if (_is_port_enabled) LED5_ON;
+
+    // if ((OTG_FS_HPRT & OTG_HPRT_PTCTL_PACKET) == OTG_HPRT_PTCTL_PACKET) LED3_ON;
+
+    while (true) {
+        (OTG_FS_HPRT | OTG_HPRT_PLSTS_DM) ? LED3_ON : LED3_OFF;
+        (OTG_FS_HPRT | OTG_HPRT_PLSTS_DP) ? LED4_ON : LED4_OFF;
+    }
+
+}
+
+bool nptx_write(const uint32_t * val, size_t len) {
+    uint32_t addr = OTG_FS_HNPTXSTS & 0xFFFF;
+    if (_fifo_space > len) {
+        addr += (TX_FIFO_SIZE - _fifo_space);
+        for (uint8_t i; i < len; i++) {
+            MMIO32(USB_OTG_FS_BASE + (((addr)+1) << 12)) = *val++;
+        }
+    } else {
+        _raise_error;
+        return false;
+    }
+    return true;
+}
+
+void usb_otg_host_poll(void) {
+    (OTG_FS_HPRT | OTG_HPRT_PLSTS_DM) ? LED3_ON : LED3_OFF;
+    (OTG_FS_HPRT | OTG_HPRT_PLSTS_DP) ? LED4_ON : LED4_OFF;
+}
+
+void adb_handshake(void) {
+    /* Perform ADB handshake */
+
+    /**
+     * 1. Send CONNECT message to device
+     * 2. Send system-information string to device
+     * 3. Device sends AUTH message
+     * 4. Send device public key
+     * 5. Device replies with CONNECT message
+     * 6. Device sends some other info
+     */
+
+    const uint8_t URB_ID[8] = {0x00, 0xf3, 0x32, 0x7c, 0x00, 0x88, 0xff, 0xff};
+    nptx_write((uint32_t *) URB_ID, 2);
+    while (!_tx_empty_detected());
+    LED6_ON;
 }
 
 inline void usb_otg_device_init(void) {
@@ -274,12 +397,18 @@ int main(void) {
 
     usb_otg_host_init();
 
+    // usb_otg_port_test();
+
+    usb_otg_channel_init();
+
     // usb_otg_ab_test();
-    usb_otg_connect_test();
+    // usb_otg_connect_test();
 
 
     // usbd_dev = usbd_init(&otgfs_usb_driver, &dev)
 
 	while (1) {
+        usb_otg_host_poll();
+        adb_handshake();
     }
 }
